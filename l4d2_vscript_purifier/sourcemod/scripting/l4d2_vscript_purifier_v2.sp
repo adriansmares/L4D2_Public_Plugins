@@ -432,7 +432,7 @@ MRESReturn DTR_LoadAddonListFile_Post(DHookReturn hReturn, DHookParam hParams)
     if (hReturn.Value == 0 || pKv == Address_Null)
         return MRES_Ignored;
 
-    SourceKeyValues kv = view_as<SourceKeyValues>(pKv);
+    SourceKeyValues kv = view_as<SourceKeyValues>(view_as<int>(pKv));
 
     if (g_bAddonListUpdateActive
         && g_bAddonListFilterArmed
