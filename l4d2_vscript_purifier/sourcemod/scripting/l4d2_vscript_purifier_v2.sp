@@ -6,7 +6,7 @@
 #include <l4d2_source_keyvalues>
 
 #define GAMEDATA             "l4d2_vscript_purifier_v2"
-#define GAMEDATA_VERSION     19
+#define GAMEDATA_VERSION     20
 #define VPK_RULE_NONE        0
 #define VPK_RULE_WHITELIST   1
 #define VPK_RULE_BLACKLIST   2
@@ -539,6 +539,20 @@ bool ApplyAddonListFilter(const char[] reason)
         return true;
     }
 
+    if (CanFilterVpksDirectly())
+    {
+        ResetVScriptPairRestoreState();
+
+        // The targets changed: put the previous set back before taking the new one away.
+        if (g_bAddonListFilterApplied)
+            RemountFilteredVpks(reason);
+
+        SaveLastFilterTargets();
+        UnmountFilteredVpks(reason);
+        g_bAddonListFilterApplied = true;
+        return true;
+    }
+
     g_bAddonListFilterArmed    = true;
     g_bAddonListRestorePending = false;
 
@@ -564,6 +578,17 @@ bool RestoreAddonListFilterNow(const char[] reason)
 
     if (!g_bAddonListFilterApplied && !g_bAddonListFilterArmed)
         return false;
+
+    if (CanFilterVpksDirectly() && g_hUnmountedVpks != null)
+    {
+        RemountFilteredVpks(reason);
+        g_bAddonListFilterApplied = false;
+        g_bAddonListFilterArmed   = false;
+
+        delete g_hLastFilterTargets;
+        g_hLastFilterTargets = null;
+        return true;
+    }
 
     g_bAddonListFilterArmed    = false;
     g_bAddonListRestorePending = true;
@@ -626,6 +651,78 @@ bool ShouldDisableAddonListKey(const char[] addonKey)
         return true;
 
     return false;
+}
+
+// update_addon_paths always unmounts every addon VPK and mounts the enabled ones again, each with a new pack store. Any
+// file opened through an old store is left reading freed memory, and while a map loads that includes the map's own BSP
+// pack: a custom map's BSP lives inside its addon VPK, so reading its embedded files (materials, models) then fails or
+// crashes the server. The engine itself switches campaigns without that, in FileSystem_ManageAddonsForActiveSession:
+// it unmounts and mounts only the VPKs that change, one by one, so every other store (the current map's included)
+// stays alive. Filter the same way.
+bool CanFilterVpksDirectly()
+{
+    return g_hSDKRemoveVPKFile != null && g_hSDKMoveOrAddVPKFile != null && g_hSDKAsyncFinishAll != null
+        && g_hSDKAsyncSuspend != null && g_hSDKAsyncResume != null && g_pAddonMetadataVector != Address_Null;
+}
+
+// Like the engine around its own changes: finish pending reads first, and keep async I/O off while VPKs change.
+void BeginVpkChanges()
+{
+    SDKCall(g_hSDKAsyncFinishAll, g_pFullFileSystem, 0);
+    SDKCall(g_hSDKAsyncSuspend, g_pFullFileSystem);
+}
+
+void EndVpkChanges()
+{
+    SDKCall(g_hSDKAsyncResume, g_pFullFileSystem);
+}
+
+void UnmountFilteredVpks(const char[] reason)
+{
+    delete g_hUnmountedVpks;
+    g_hUnmountedVpks = new ArrayList(ByteCountToCells(sizeof(AddonMetadata::file)));
+
+    AddonMetadata metadata;
+    Address       memory = LoadFromAddress(g_pAddonMetadataVector, NumberType_Int32);
+    int           size   = LoadFromAddress(g_pAddonMetadataVector + view_as<Address>(12), NumberType_Int32);
+
+    BeginVpkChanges();
+    for (int i = 0; i < size; ++i)
+    {
+        // The metadata's file is the path the VPK is mounted under, which is what the engine passes too.
+        ReadMemoryString(memory + view_as<Address>(i * 4 * sizeof(metadata) + 4 * AddonMetadata::file), metadata.file, sizeof(metadata.file));
+
+        int len = strlen(metadata.file);
+        if (len < 4 || !StrEqual(metadata.file[len - 4], ".vpk", false) || !ShouldDisableAddonListKey(metadata.file))
+            continue;
+
+        // RemoveVPKFile returns nothing. The engine builds this metadata from the mounted addons, so every entry is mounted.
+        SDKCall(g_hSDKRemoveVPKFile, g_pFullFileSystem, metadata.file);
+        g_hUnmountedVpks.PushString(metadata.file);
+    }
+    EndVpkChanges();
+
+    LogMessage("unmounted %d addon VPKs, reason: %s", g_hUnmountedVpks.Length, reason);
+}
+
+void RemountFilteredVpks(const char[] reason)
+{
+    if (g_hUnmountedVpks == null)
+        return;
+
+    char file[sizeof(AddonMetadata::file)];
+
+    BeginVpkChanges();
+    for (int i = 0; i < g_hUnmountedVpks.Length; i++)
+    {
+        g_hUnmountedVpks.GetString(i, file, sizeof(file));
+        // PATH_ADD_TO_TAIL: where the engine keeps inactive campaigns on a dedicated server.
+        SDKCall(g_hSDKMoveOrAddVPKFile, g_pFullFileSystem, file, 1);
+    }
+    EndVpkChanges();
+
+    LogMessage("remounted %d addon VPKs, reason: %s", g_hUnmountedVpks.Length, reason);
+    delete g_hUnmountedVpks;
 }
 
 bool ExecuteUpdateAddonPaths(const char[] reason)
@@ -2133,6 +2230,53 @@ bool IsValidMenuClient(int client)
     return client > 0 && client <= MaxClients && IsClientInGame(client);
 }
 
+// The filesystem calls the engine's FileSystem_ManageAddonsForActiveSession uses (Linux only so far; without them the
+// plugin falls back to update_addon_paths).
+Handle
+    g_hSDKRemoveVPKFile,
+    g_hSDKMoveOrAddVPKFile,
+    g_hSDKAsyncFinishAll,
+    g_hSDKAsyncSuspend,
+    g_hSDKAsyncResume;
+
+Address
+    g_pFullFileSystem;
+
+ArrayList
+    g_hUnmountedVpks;
+
+// No parameter or return value, for PrepFileSystemCall.
+#define SDKType_None view_as<SDKType>(-1)
+
+Handle PrepFileSystemCall(GameData gd, const char[] name, SDKType param1 = SDKType_None, SDKType param2 = SDKType_None, SDKType ret = SDKType_None)
+{
+    StartPrepSDKCall(SDKCall_Raw);
+    if (!PrepSDKCall_SetFromConf(gd, SDKConf_Virtual, name))
+        return null;
+
+    if (param1 != SDKType_None)
+        PrepSDKCall_AddParameter(param1, param1 == SDKType_String ? SDKPass_Pointer : SDKPass_Plain);
+    if (param2 != SDKType_None)
+        PrepSDKCall_AddParameter(param2, param2 == SDKType_String ? SDKPass_Pointer : SDKPass_Plain);
+    if (ret != SDKType_None)
+        PrepSDKCall_SetReturnInfo(ret, SDKPass_Plain);
+
+    return EndPrepSDKCall();
+}
+
+void InitFileSystemCalls(GameData gd)
+{
+    g_pFullFileSystem = gd.GetAddress("g_pFullFileSystem");
+    if (g_pFullFileSystem == Address_Null)
+        return;
+
+    g_hSDKRemoveVPKFile    = PrepFileSystemCall(gd, "IFileSystem::RemoveVPKFile", SDKType_String);
+    g_hSDKMoveOrAddVPKFile = PrepFileSystemCall(gd, "IFileSystem::MoveOrAddVPKFile", SDKType_String, SDKType_PlainOldData);
+    g_hSDKAsyncFinishAll   = PrepFileSystemCall(gd, "IFileSystem::AsyncFinishAll", SDKType_PlainOldData);
+    g_hSDKAsyncSuspend     = PrepFileSystemCall(gd, "IFileSystem::AsyncSuspend");
+    g_hSDKAsyncResume      = PrepFileSystemCall(gd, "IFileSystem::AsyncResume");
+}
+
 void InitGameData()
 {
     CheckGameDataFile();
@@ -2158,6 +2302,10 @@ void InitGameData()
     {
         PrintToServer("Falied to Patch msg_VScriptServerRunScriptForAllAddons");
     }
+
+    InitFileSystemCalls(gd);
+    if (!CanFilterVpksDirectly())
+        LogError("Filesystem calls unavailable, falling back to update_addon_paths; custom maps may crash while loading.");
 
     delete gd.CreateDetourOrFail("KeyValues::GetString", true, _, DTR_KeyValues_GetString_Post);
     delete gd.CreateDetourOrFail("FileSystem_UpdateAddonSearchPaths", true, DTR_PreFileSystem_UpdateAddonSearchPaths, DTR_PostFileSystem_UpdateAddonSearchPaths);
@@ -2214,6 +2362,14 @@ void CheckGameDataFile()
             hFile.WriteLine("	{");
             hFile.WriteLine("		\"Addresses\"");
             hFile.WriteLine("		{");
+            hFile.WriteLine("			\"g_pFullFileSystem\"");
+            hFile.WriteLine("			{");
+            hFile.WriteLine("			    \"linux\"");
+            hFile.WriteLine("			    {");
+            hFile.WriteLine("				    \"signature\"		\"g_pFullFileSystem\"");
+            hFile.WriteLine("				    \"read\"	    \"0\"");
+            hFile.WriteLine("			    }");
+            hFile.WriteLine("			}");
             hFile.WriteLine("			\"s_vecAddonMetadata\"");
             hFile.WriteLine("			{");
             hFile.WriteLine("			    \"linux\"");
@@ -2238,6 +2394,26 @@ void CheckGameDataFile()
             hFile.WriteLine("			{");
             hFile.WriteLine("				\"linux\"		\"1\"");
             hFile.WriteLine("				\"windows\"	    \"0\"");
+            hFile.WriteLine("			}");
+            hFile.WriteLine("			\"IFileSystem::AsyncFinishAll\"");
+            hFile.WriteLine("			{");
+            hFile.WriteLine("				\"linux\"		\"42\"");
+            hFile.WriteLine("			}");
+            hFile.WriteLine("			\"IFileSystem::AsyncSuspend\"");
+            hFile.WriteLine("			{");
+            hFile.WriteLine("				\"linux\"		\"45\"");
+            hFile.WriteLine("			}");
+            hFile.WriteLine("			\"IFileSystem::AsyncResume\"");
+            hFile.WriteLine("			{");
+            hFile.WriteLine("				\"linux\"		\"46\"");
+            hFile.WriteLine("			}");
+            hFile.WriteLine("			\"IFileSystem::RemoveVPKFile\"");
+            hFile.WriteLine("			{");
+            hFile.WriteLine("				\"linux\"		\"108\"");
+            hFile.WriteLine("			}");
+            hFile.WriteLine("			\"IFileSystem::MoveOrAddVPKFile\"");
+            hFile.WriteLine("			{");
+            hFile.WriteLine("				\"linux\"		\"109\"");
             hFile.WriteLine("			}");
             hFile.WriteLine("		}");
             hFile.WriteLine("");
@@ -2309,6 +2485,12 @@ void CheckGameDataFile()
             hFile.WriteLine("				\"library\" \"engine\"");
             hFile.WriteLine("				\"linux\"		\"@_Z17LoadAddonListFilePKcRP9KeyValues\"");
             hFile.WriteLine("				\"windows\"	\"\\x55\\x8B\\xEC\\x81\\xEC\\x18\\x03\\x00\\x00\\xA1\\x2A\\x2A\\x2A\\x2A\\x33\\xC5\\x89\\x45\\xFC\\x8B\\x45\\x08\\x56\"");
+            hFile.WriteLine("			}");
+            hFile.WriteLine("");
+            hFile.WriteLine("			\"g_pFullFileSystem\"");
+            hFile.WriteLine("			{");
+            hFile.WriteLine("				\"library\" \"server\"");
+            hFile.WriteLine("				\"linux\"		\"@g_pFullFileSystem\"");
             hFile.WriteLine("			}");
             hFile.WriteLine("");
             hFile.WriteLine("		}");
