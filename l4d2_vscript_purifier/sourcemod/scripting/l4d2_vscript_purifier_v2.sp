@@ -65,7 +65,6 @@ enum struct AddonMetadata
 
 ArrayList
     g_hContentList,
-    g_hChangedCvars,
     g_hBlockedMissionVpks,
     g_hAllowedMapVpks,
     g_hLastFilterTargets,
@@ -103,6 +102,7 @@ int
     g_iGbkUnicodeMap[65536];
 
 StringMap
+    g_hChangedCvars,
     g_hVpkRules,
     g_hVpkBindings;
 
@@ -146,7 +146,7 @@ public void OnPluginStart()
     g_hCvarRestore = CreateConVar(
         "l4d2_vscript_cvarRestore_v2",
         "1",
-        "脚本修改 cvar 的处理方式：0=不处理，1=过关/回合开始时恢复默认值，2=直接拦截脚本修改请求。",
+        "脚本修改 cvar 的处理方式：0=不处理，1=过关/回合开始时恢复脚本修改前的值，2=直接拦截脚本修改请求。",
         FCVAR_NOTIFY,
         true,
         0.0,
@@ -319,32 +319,36 @@ void Call_VeryEarly()
     if (!g_bAllowCall)
         return;
 
-    RestoreConvarDefault();
+    RestoreConvarValues();
 
     delete g_hChangedCvars;
-    g_hChangedCvars = new ArrayList(ByteCountToCells(64));
+    g_hChangedCvars = new StringMap();
 
     g_bAllowCall    = false;
 }
 
-void RestoreConvarDefault()
+void RestoreConvarValues()
 {
     if (g_iCvarRestore != 1 || g_hChangedCvars == null)
         return;
 
-    char   buffer[64];
-    ConVar tempCvar;
+    // Restore the values from before the scripts changed them, not the engine defaults: a round restart does not run
+    // the server configs again, so their values would be lost until the next map.
+    char              name[64], value[256];
+    ConVar            tempCvar;
+    StringMapSnapshot snapshot = g_hChangedCvars.Snapshot();
 
-    for (int i = 0; i < g_hChangedCvars.Length; i++)
+    for (int i = 0; i < snapshot.Length; i++)
     {
-        tempCvar = null;
+        snapshot.GetKey(i, name, sizeof(name));
+        g_hChangedCvars.GetString(name, value, sizeof(value));
 
-        g_hChangedCvars.GetString(i, buffer, sizeof(buffer));
-        tempCvar = FindConVar(buffer);
-
+        tempCvar = FindConVar(name);
         if (tempCvar != null)
-            tempCvar.RestoreDefault(true);
+            tempCvar.SetString(value, true);
     }
+
+    delete snapshot;
 }
 
 MRESReturn DTR_PreVScriptServerRunScriptForAllAddons(DHookReturn hReturn, DHookParam hParams)
@@ -515,10 +519,20 @@ MRESReturn DTR_PreCScriptConvarAccessor_SetValue(DHookReturn hReturn, DHookParam
     char cvarName[64];
     DHookGetParamString(hParams, 1, cvarName, sizeof(cvarName));
 
-    if (g_hChangedCvars == null)
-        g_hChangedCvars = new ArrayList(ByteCountToCells(64));
+    ConVar cvar = FindConVar(cvarName);
+    if (cvar == null)
+        return MRES_Ignored;
 
-    g_hChangedCvars.PushString(cvarName);
+    if (g_hChangedCvars == null)
+        g_hChangedCvars = new StringMap();
+
+    // Only the first change records the value to restore.
+    if (!g_hChangedCvars.ContainsKey(cvarName))
+    {
+        char value[256];
+        cvar.GetString(value, sizeof(value));
+        g_hChangedCvars.SetString(cvarName, value);
+    }
 
     return MRES_Ignored;
 }
