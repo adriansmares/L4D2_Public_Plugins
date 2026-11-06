@@ -89,16 +89,14 @@ bool
     g_bAddonListFilterApplied,
     g_bAddonListRestorePending,
     g_bAddonFilterMapReady,
-    g_bExecutingUpdateAddonPaths,
-    g_bVScriptPairRestorePending;
+    g_bExecutingUpdateAddonPaths;
 
 int
     g_iCvarSwitch,
     g_iCvarRestore,
     g_iBlacklistedRuleCount,
     g_iAddonListLoadCallCount,
-    g_iVScriptScriptedModeCount,
-    g_iVScriptDirectorBaseCount,
+    g_iScriptRunDepth,
     g_iGbkUnicodeMap[65536];
 
 StringMap
@@ -204,7 +202,7 @@ public void OnClientDisconnect(int client)
 public void OnMapInit(const char[] mapName)
 {
     g_bAddonFilterMapReady = false;
-    ResetVScriptPairRestoreState();
+    g_iScriptRunDepth      = 0;
 
     delete g_hContentList;
     delete g_hBlockedMissionVpks;
@@ -307,13 +305,6 @@ void ExecConfigsEarly()
     UpdateCvars();
 }
 
-void ResetVScriptPairRestoreState()
-{
-    g_iVScriptScriptedModeCount  = 0;
-    g_iVScriptDirectorBaseCount  = 0;
-    g_bVScriptPairRestorePending = false;
-}
-
 void Call_VeryEarly()
 {
     if (!g_bAllowCall)
@@ -351,46 +342,54 @@ void RestoreConvarValues()
     delete snapshot;
 }
 
+// Keep the other campaigns unmounted only while addon scripts run. Everything between those runs (the map's entities
+// spawning, models and materials precaching) must see the same files as without this plugin: a material created while
+// a VPK is mounted, then precached again while it is not, gets the error shader, which the dedicated server lacks
+// (Wireframe_DX9), and crashes in CMaterial::SetupErrorShader.
+void BeginScriptRun(const char[] reason)
+{
+    if (g_iScriptRunDepth++ == 0)
+        ApplyAddonListFilter(reason);
+}
+
+void EndScriptRun(const char[] reason)
+{
+    if (g_iScriptRunDepth == 0)
+        return;
+
+    // The update_addon_paths fallback remounts every addon VPK, which is what crashes custom maps while they load: keep
+    // its filter until the level shuts down rather than running it around every script.
+    if (--g_iScriptRunDepth == 0 && CanFilterVpksDirectly())
+        RestoreAddonListFilterNow(reason);
+}
+
 MRESReturn DTR_PreVScriptServerRunScriptForAllAddons(DHookReturn hReturn, DHookParam hParams)
 {
     char key[64];
-
     if (!DHookIsNullParam(hParams, 1))
         DHookGetParamString(hParams, 1, key, sizeof(key));
 
-    ApplyAddonListFilter("DTR_PreVScriptServerRunScriptForAllAddons");
-
-    if (StrEqual(key, "scriptedmode", false))
-        g_iVScriptScriptedModeCount++;
-    else if (StrEqual(key, "director_base", false))
-        g_iVScriptDirectorBaseCount++;
-
-    if (g_iVScriptScriptedModeCount >= 2 && g_iVScriptDirectorBaseCount >= 2)
-        g_bVScriptPairRestorePending = true;
-
+    char reason[96];
+    FormatEx(reason, sizeof(reason), "VScriptServerRunScriptForAllAddons %s", key);
+    BeginScriptRun(reason);
     return MRES_Ignored;
 }
 
 MRESReturn DTR_PostVScriptServerRunScriptForAllAddons(DHookReturn hReturn, DHookParam hParams)
 {
-    if (!g_bVScriptPairRestorePending)
-        return MRES_Ignored;
-
-    if (RestoreAddonListFilterNow("DTR_PostVScriptServerRunScriptForAllAddons scriptedmode/director_base x2"))
-    {
-        ResetVScriptPairRestoreState();
-    }
-    else
-    {
-        g_bVScriptPairRestorePending = false;
-    }
-
+    EndScriptRun("VScriptServerRunScriptForAllAddons");
     return MRES_Ignored;
 }
 
 MRESReturn DTR_PreCDirectorChallengeMode_InitScriptsNonVirtual(DHookReturn hReturn)
 {
-    ApplyAddonListFilter("DTR_PreCDirectorChallengeMode_InitScriptsNonVirtual");
+    BeginScriptRun("CDirectorChallengeMode::InitScriptsNonVirtual");
+    return MRES_Ignored;
+}
+
+MRESReturn DTR_PostCDirectorChallengeMode_InitScriptsNonVirtual(DHookReturn hReturn)
+{
+    EndScriptRun("CDirectorChallengeMode::InitScriptsNonVirtual");
     return MRES_Ignored;
 }
 
@@ -499,7 +498,7 @@ MRESReturn DTR_KeyValues_GetString_Post(Address pKeyValue, DHookReturn hReturn, 
 
 MRESReturn DTR_PreCServerPlugin_LevelShutdown(Address CServerPlugin)
 {
-    ResetVScriptPairRestoreState();
+    g_iScriptRunDepth      = 0;
     g_bAddonFilterMapReady = false;
     RestoreAddonListFilterNow("CServerPlugin::LevelShutdown");
     return MRES_Ignored;
@@ -555,8 +554,6 @@ bool ApplyAddonListFilter(const char[] reason)
 
     if (CanFilterVpksDirectly())
     {
-        ResetVScriptPairRestoreState();
-
         // The targets changed: put the previous set back before taking the new one away.
         if (g_bAddonListFilterApplied)
             RemountFilteredVpks(reason);
@@ -569,8 +566,6 @@ bool ApplyAddonListFilter(const char[] reason)
 
     g_bAddonListFilterArmed    = true;
     g_bAddonListRestorePending = false;
-
-    ResetVScriptPairRestoreState();
 
     SaveLastFilterTargets();
 
@@ -2325,7 +2320,7 @@ void InitGameData()
     delete gd.CreateDetourOrFail("FileSystem_UpdateAddonSearchPaths", true, DTR_PreFileSystem_UpdateAddonSearchPaths, DTR_PostFileSystem_UpdateAddonSearchPaths);
     delete gd.CreateDetourOrFail("LoadAddonListFile", true, _, DTR_LoadAddonListFile_Post);
     delete gd.CreateDetourOrFail("CMatchExtL4D::ParseMissionFromFile", true, DTR_PreParseMissionFromFile, DTR_ParseMissionFromFile_Post);
-    delete gd.CreateDetourOrFail("CDirectorChallengeMode::InitScriptsNonVirtual", true, DTR_PreCDirectorChallengeMode_InitScriptsNonVirtual);
+    delete gd.CreateDetourOrFail("CDirectorChallengeMode::InitScriptsNonVirtual", true, DTR_PreCDirectorChallengeMode_InitScriptsNonVirtual, DTR_PostCDirectorChallengeMode_InitScriptsNonVirtual);
     delete gd.CreateDetourOrFail("CScriptConvarAccessor::SetValue", true, DTR_PreCScriptConvarAccessor_SetValue);
     delete gd.CreateDetourOrFail("CServerPlugin::LevelShutdown", true, DTR_PreCServerPlugin_LevelShutdown);
     delete gd.CreateDetourOrFail("VScriptServerRunScriptForAllAddons", true, DTR_PreVScriptServerRunScriptForAllAddons, DTR_PostVScriptServerRunScriptForAllAddons);
